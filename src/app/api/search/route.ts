@@ -281,6 +281,16 @@ export async function GET(request: NextRequest) {
       return weightB - weightA;
     });
 
+    // ==================== 【二次关键词二次过滤逻辑】 ====================
+    // 强制过滤所有标题中不包含搜索词 query 的废数据（防止不支持搜索的资源站污染列表）
+    if (query && query.trim() !== '') {
+      const lowerQuery = query.toLowerCase().trim();
+      flattenedResults = flattenedResults.filter((item) => {
+        return item && item.title && item.title.toLowerCase().includes(lowerQuery);
+      });
+    }
+    // ===================================================================
+
     const cacheTime = await getCacheTime();
 
     if (flattenedResults.length === 0) {
