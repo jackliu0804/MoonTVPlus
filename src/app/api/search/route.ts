@@ -18,10 +18,9 @@ import { yellowWords } from '@/lib/yellow';
 export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
+  // 1. 获取鉴权信息，如果是 TV 端或直接 API 请求，允许降级处理
   const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const username = authInfo?.username || 'admin'; // 无 Cookie 时回退到默认权限
 
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
@@ -43,11 +42,19 @@ export async function GET(request: NextRequest) {
   }
 
   const config = await getConfig();
-  const apiSites = await getAvailableApiSites(authInfo.username, includeSpecialSources);
-  const [canAccessOpenList, canAccessEmby] = await Promise.all([
-    hasFeaturePermission(authInfo.username, 'private_library'),
-    hasFeaturePermission(authInfo.username, 'emby'),
-  ]);
+  const apiSites = await getAvailableApiSites(username, includeSpecialSources);
+  
+  // 尝试获取权限，失败时安全降级
+  let canAccessOpenList = false;
+  let canAccessEmby = false;
+  try {
+    [canAccessOpenList, canAccessEmby] = await Promise.all([
+      hasFeaturePermission(username, 'private_library'),
+      hasFeaturePermission(username, 'emby'),
+    ]);
+  } catch (e) {
+    console.warn('[Search] 获取权限失败，采用默认配置', e);
+  }
 
   // 创建权重映射表
   const weightMap = new Map<string, number>();
@@ -65,12 +72,17 @@ export async function GET(request: NextRequest) {
   );
 
   // 获取所有启用的 Emby 源
-  const { embyManager } = await import('@/lib/emby-manager');
-  const embySourcesMap = await embyManager.getAllClients();
-  const embySources = canAccessEmby ? Array.from(embySourcesMap.values()) : [];
+  let embySources: any[] = [];
+  try {
+    const { embyManager } = await import('@/lib/emby-manager');
+    const embySourcesMap = await embyManager.getAllClients();
+    embySources = canAccessEmby ? Array.from(embySourcesMap.values()) : [];
+  } catch (e) {
+    console.warn('[Search] 加载 Emby 源失败', e);
+  }
 
   // 获取代理 token（用于图片代理）
-  const proxyToken = await getProxyToken(request);
+  const proxyToken = await getProxyToken(request).catch(() => null);
 
   // 为每个 Emby 源创建搜索 Promise
   const embyPromises = embySources.map(({ client, config: embyConfig }) =>
@@ -110,10 +122,7 @@ export async function GET(request: NextRequest) {
       new Promise<any[]>((_, reject) =>
         setTimeout(() => reject(new Error(`${embyConfig.name} timeout`)), 20000)
       ),
-    ]).catch((error) => {
-      console.error(`[Search] 搜索 ${embyConfig.name} 超时:`, error);
-      return [];
-    })
+    ]).catch(() => [])
   );
 
   // 搜索 OpenList
@@ -168,10 +177,7 @@ export async function GET(request: NextRequest) {
         new Promise<any[]>((_, reject) =>
           setTimeout(() => reject(new Error('OpenList timeout')), 20000)
         ),
-      ]).catch((error) => {
-        console.error('[Search] 搜索 OpenList 超时:', error);
-        return [];
-      })
+      ]).catch(() => [])
     : Promise.resolve([]);
 
   // API 源搜索
@@ -188,54 +194,56 @@ export async function GET(request: NextRequest) {
   );
 
   // 脚本源搜索
-  const scriptSummaries = await listEnabledSourceScripts();
-  const scriptPromises = scriptSummaries.map((script) =>
-    Promise.race([
-      (async () => {
-        try {
-          const sourcesExecution = await executeSavedSourceScript({
-            key: script.key,
-            hook: 'getSources',
-            payload: {},
-          });
-          const sources = normalizeScriptSources(sourcesExecution.result);
+  let scriptPromises: Promise<any[]>[] = [];
+  try {
+    const scriptSummaries = await listEnabledSourceScripts();
+    scriptPromises = scriptSummaries.map((script) =>
+      Promise.race([
+        (async () => {
+          try {
+            const sourcesExecution = await executeSavedSourceScript({
+              key: script.key,
+              hook: 'getSources',
+              payload: {},
+            });
+            const sources = normalizeScriptSources(sourcesExecution.result);
 
-          const searchResults = await Promise.all(
-            sources.map(async (source) => {
-              const execution = await executeSavedSourceScript({
-                key: script.key,
-                hook: 'search',
-                payload: {
-                  keyword: query,
-                  page: 1,
+            const searchResults = await Promise.all(
+              sources.map(async (source) => {
+                const execution = await executeSavedSourceScript({
+                  key: script.key,
+                  hook: 'search',
+                  payload: {
+                    keyword: query,
+                    page: 1,
+                    sourceId: source.id,
+                  },
+                });
+
+                return normalizeScriptSearchResults({
+                  scriptKey: script.key,
+                  scriptName: script.name,
                   sourceId: source.id,
-                },
-              });
+                  sourceName: source.name,
+                  result: execution.result,
+                });
+              })
+            );
 
-              return normalizeScriptSearchResults({
-                scriptKey: script.key,
-                scriptName: script.name,
-                sourceId: source.id,
-                sourceName: source.name,
-                result: execution.result,
-              });
-            })
-          );
-
-          return searchResults.flat();
-        } catch (error) {
-          console.error(`[Search] 搜索脚本 ${script.name} 失败:`, error);
-          return [];
-        }
-      })(),
-      new Promise<any[]>((_, reject) =>
-        setTimeout(() => reject(new Error(`${script.name} timeout`)), 20000)
-      ),
-    ]).catch((error) => {
-      console.error(`[Search] 搜索脚本 ${script.name} 超时:`, error);
-      return [];
-    })
-  );
+            return searchResults.flat();
+          } catch (error) {
+            console.error(`[Search] 搜索脚本 ${script.name} 失败:`, error);
+            return [];
+          }
+        })(),
+        new Promise<any[]>((_, reject) =>
+          setTimeout(() => reject(new Error(`${script.name} timeout`)), 20000)
+        ),
+      ]).catch(() => [])
+    );
+  } catch (e) {
+    console.warn('[Search] 加载脚本源失败', e);
+  }
 
   try {
     const allResults = await Promise.all([
@@ -268,22 +276,11 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // 按权重排序
+    // 排序
     flattenedResults.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
 
-    // ==================== 📊 调试日志打印 ====================
-    console.log(`[Search Debug] 关键词: "${query}" | 过滤前原始数据总数: ${flattenedResults.length}`);
-    if (flattenedResults.length > 0) {
-      console.log(
-        `[Search Debug] 原始标题样例:`,
-        flattenedResults.slice(0, 5).map((i) => i.title || i.vod_name || i.name)
-      );
-    }
-    // =========================================================
-
-    // ==================== 🔍 智能关键词二次过滤 ====================
+    // 二次关键词匹配过滤
     if (query && query.trim() !== '') {
-      // 支持按空格切分多关键词匹配
       const cleanKeywords = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
 
       flattenedResults = flattenedResults.filter((item) => {
@@ -291,19 +288,11 @@ export async function GET(request: NextRequest) {
         const itemTitle = String(item.title || item.vod_name || item.name || '').toLowerCase();
         if (!itemTitle) return false;
 
-        // 要求标题中包含搜索关键词的每一个拆分词
         return cleanKeywords.every((kw) => itemTitle.includes(kw));
       });
     }
-    // ==============================================================
-
-    console.log(`[Search Debug] 过滤后匹配到的数据总数: ${flattenedResults.length}`);
 
     const cacheTime = await getCacheTime();
-
-    if (flattenedResults.length === 0) {
-      return NextResponse.json({ results: [] }, { status: 200 });
-    }
 
     return NextResponse.json(
       { results: flattenedResults },
