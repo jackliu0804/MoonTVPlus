@@ -19,7 +19,9 @@ export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
   const authInfo = getAuthInfoFromCookie(request);
-  const username = authInfo?.username || 'admin';
+  if (!authInfo || !authInfo.username) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
 
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
@@ -41,137 +43,265 @@ export async function GET(request: NextRequest) {
   }
 
   const config = await getConfig();
+  const apiSites = await getAvailableApiSites(authInfo.username, includeSpecialSources);
+  const [canAccessOpenList, canAccessEmby] = await Promise.all([
+    hasFeaturePermission(authInfo.username, 'private_library'),
+    hasFeaturePermission(authInfo.username, 'emby'),
+  ]);
 
-  // 1. 强制保证获取到 API 资源站列表（若无用户权限数据，直接从全局 Config 读取）
-  let apiSites = await getAvailableApiSites(username, includeSpecialSources).catch(() => []);
-  if (!apiSites || apiSites.length === 0) {
-    console.warn('[Search] getAvailableApiSites 为空，强行提取全局配置源');
-    apiSites = (config.SourceConfig || []).filter((s: any) => !s.disabled);
-  }
-
-  console.log(`[Search] 参与搜索的 API 站点数量: ${apiSites.length}`);
-
-  // 权重映射表
+  // 创建权重映射表
   const weightMap = new Map<string, number>();
-  (config.SourceConfig || []).forEach((source: any) => {
+  config.SourceConfig.forEach(source => {
     weightMap.set(source.key, source.weight ?? 0);
   });
 
-  // 2. 搜索所有 API 源
-  const searchPromises = apiSites.map((site: any) =>
+  // 检查是否配置了 OpenList
+  const hasOpenList = !!(
+    canAccessOpenList &&
+    config.OpenListConfig?.Enabled &&
+    config.OpenListConfig?.URL &&
+    config.OpenListConfig?.Username &&
+    config.OpenListConfig?.Password
+  );
+
+  // 获取所有启用的 Emby 源
+  const { embyManager } = await import('@/lib/emby-manager');
+  const embySourcesMap = await embyManager.getAllClients();
+  const embySources = canAccessEmby ? Array.from(embySourcesMap.values()) : [];
+
+  console.log('[Search] Emby sources count:', embySources.length);
+  console.log('[Search] Emby sources:', embySources.map(s => ({ key: s.config.key, name: s.config.name })));
+
+  // 获取代理 token（用于图片代理）
+  const proxyToken = await getProxyToken(request);
+
+  // 为每个 Emby 源创建搜索 Promise（全部并发，无限制）
+  const embyPromises = embySources.map(({ client, config: embyConfig }) =>
     Promise.race([
-      searchFromApi(site, query),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`${site.name || site.key} 超时(15s)`)), 15000)
+      (async () => {
+        try {
+          const searchResult = await client.getItems({
+            searchTerm: query,
+            IncludeItemTypes: 'Movie,Series',
+            Recursive: true,
+            Fields: 'Overview,ProductionYear',
+            Limit: 50,
+          });
+
+          // 如果只有一个Emby源，保持旧格式（向后兼容）
+          const sourceValue = embySources.length === 1 ? 'emby' : `emby_${embyConfig.key}`;
+          const sourceName = embySources.length === 1 ? 'Emby' : embyConfig.name;
+
+          return searchResult.Items.map((item) => ({
+            id: item.Id,
+            source: sourceValue,
+            source_name: sourceName,
+            weight: weightMap.get(sourceValue) ?? 0,
+            title: item.Name,
+            poster: client.getImageUrl(item.Id, 'Primary', undefined, client.isProxyEnabled() ? proxyToken || undefined : undefined),
+            episodes: [],
+            episodes_titles: [],
+            year: item.ProductionYear?.toString() || '',
+            desc: item.Overview || '',
+            type_name: item.Type === 'Movie' ? '电影' : '电视剧',
+            douban_id: 0,
+          }));
+        } catch (error) {
+          console.error(`[Search] 搜索 ${embyConfig.name} 失败:`, error);
+          return [];
+        }
+      })(),
+      new Promise<any[]>((_, reject) =>
+        setTimeout(() => reject(new Error(`${embyConfig.name} timeout`)), 20000)
       ),
-    ]).catch((err) => {
-      console.error(`[Search] 站点搜索失败 [${site.name || site.key}]:`, err.message);
+    ]).catch((error) => {
+      console.error(`[Search] 搜索 ${embyConfig.name} 超时:`, error);
       return [];
     })
   );
 
-  // 3. 搜索脚本源
-  let scriptPromises: Promise<any[]>[] = [];
-  try {
-    const scriptSummaries = await listEnabledSourceScripts();
-    scriptPromises = scriptSummaries.map((script) =>
-      Promise.race([
+  // 搜索 OpenList（如果配置了）- 异步带超时
+  const openlistPromise = hasOpenList
+    ? Promise.race([
         (async () => {
           try {
-            const sourcesExecution = await executeSavedSourceScript({
-              key: script.key,
-              hook: 'getSources',
-              payload: {},
-            });
-            const sources = normalizeScriptSources(sourcesExecution.result);
+            const { getCachedMetaInfo, setCachedMetaInfo } = await import('@/lib/openlist-cache');
+            const { getTMDBImageUrl } = await import('@/lib/tmdb.search');
+            const { db } = await import('@/lib/db');
 
-            const searchResults = await Promise.all(
-              sources.map(async (source) => {
-                const execution = await executeSavedSourceScript({
-                  key: script.key,
-                  hook: 'search',
-                  payload: {
-                    keyword: query,
-                    page: 1,
-                    sourceId: source.id,
-                  },
-                });
+            let metaInfo = getCachedMetaInfo();
 
-                return normalizeScriptSearchResults({
-                  scriptKey: script.key,
-                  scriptName: script.name,
-                  sourceId: source.id,
-                  sourceName: source.name,
-                  result: execution.result,
-                });
-              })
-            );
+            if (!metaInfo) {
+              const metainfoJson = await db.getGlobalValue('video.metainfo');
+              if (metainfoJson) {
+                metaInfo = JSON.parse(metainfoJson);
+                if (metaInfo) {
+                  setCachedMetaInfo(metaInfo);
+                }
+              }
+            }
 
-            return searchResults.flat();
+            if (metaInfo && metaInfo.folders) {
+              return Object.entries(metaInfo.folders)
+                .filter(([folderName, info]: [string, any]) => {
+                  const matchFolder = folderName.toLowerCase().includes(query.toLowerCase());
+                  const matchTitle = info.title.toLowerCase().includes(query.toLowerCase());
+                  return matchFolder || matchTitle;
+                })
+                .map(([folderName, info]: [string, any]) => ({
+                  id: folderName,
+                  source: 'openlist',
+                  source_name: '私人影库',
+                  weight: weightMap.get('openlist') ?? 0,
+                  title: info.title,
+                  poster: getTMDBImageUrl(info.poster_path),
+                  episodes: [],
+                  episodes_titles: [],
+                  year: info.release_date.split('-')[0] || '',
+                  desc: info.overview,
+                  type_name: info.media_type === 'movie' ? '电影' : '电视剧',
+                  douban_id: 0,
+                }));
+            }
+            return [];
           } catch (error) {
-            console.error(`[Search] 脚本搜索失败 [${script.name}]:`, error);
+            console.error('[Search] 搜索 OpenList 失败:', error);
             return [];
           }
         })(),
         new Promise<any[]>((_, reject) =>
-          setTimeout(() => reject(new Error(`${script.name} 超时`)), 15000)
+          setTimeout(() => reject(new Error('OpenList timeout')), 20000)
         ),
-      ]).catch(() => [])
-    );
-  } catch (e) {
-    console.warn('[Search] 加载脚本源失败', e);
-  }
+      ]).catch((error) => {
+        console.error('[Search] 搜索 OpenList 超时:', error);
+        return [];
+      })
+    : Promise.resolve([]);
+
+  // 添加超时控制和错误处理，避免慢接口拖累整体响应
+  const searchPromises = apiSites.map((site) =>
+    Promise.race([
+      searchFromApi(site, query),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${site.name} timeout`)), 20000)
+      ),
+    ]).catch((err) => {
+      console.warn(`搜索失败 ${site.name}:`, err.message);
+      return []; // 返回空数组而不是抛出错误
+    })
+  );
+
+  const scriptSummaries = await listEnabledSourceScripts();
+  const scriptPromises = scriptSummaries.map((script) =>
+    Promise.race([
+      (async () => {
+        try {
+          const sourcesExecution = await executeSavedSourceScript({
+            key: script.key,
+            hook: 'getSources',
+            payload: {},
+          });
+          const sources = normalizeScriptSources(sourcesExecution.result);
+
+          const searchResults = await Promise.all(
+            sources.map(async (source) => {
+              const execution = await executeSavedSourceScript({
+                key: script.key,
+                hook: 'search',
+                payload: {
+                  keyword: query,
+                  page: 1,
+                  sourceId: source.id,
+                },
+              });
+
+              return normalizeScriptSearchResults({
+                scriptKey: script.key,
+                scriptName: script.name,
+                sourceId: source.id,
+                sourceName: source.name,
+                result: execution.result,
+              });
+            })
+          );
+
+          return searchResults.flat();
+        } catch (error) {
+          console.error(`[Search] 搜索脚本 ${script.name} 失败:`, error);
+          return [];
+        }
+      })(),
+      new Promise<any[]>((_, reject) =>
+        setTimeout(() => reject(new Error(`${script.name} timeout`)), 20000)
+      ),
+    ]).catch((error) => {
+      console.error(`[Search] 搜索脚本 ${script.name} 超时:`, error);
+      return [];
+    })
+  );
 
   try {
     const allResults = await Promise.all([
+      openlistPromise,
+      ...embyPromises,
       ...searchPromises,
       ...scriptPromises,
     ]);
 
-    const apiResultsFlat = allResults.filter(Array.isArray).flat();
-    let flattenedResults = [...apiResultsFlat];
+    // 分离结果：第一个是 openlist，接下来是 emby 结果，最后是 api 结果
+    // 添加安全检查，确保即使某个结果处理出错也不影响其他结果
+    const openlistResults = Array.isArray(allResults[0]) ? allResults[0] : [];
+    const embyResultsArray = allResults.slice(1, 1 + embyPromises.length);
+    const apiResults = allResults.slice(1 + embyPromises.length, 1 + embyPromises.length + searchPromises.length);
+    const scriptResults = allResults.slice(1 + embyPromises.length + searchPromises.length);
+
+    // 合并所有 Emby 结果，添加安全检查
+    const embyResults = embyResultsArray.filter(Array.isArray).flat();
+    const apiResultsFlat = apiResults.filter(Array.isArray).flat();
+    const scriptResultsFlat = scriptResults.filter(Array.isArray).flat();
+
+    let flattenedResults = [...openlistResults, ...embyResults, ...apiResultsFlat, ...scriptResultsFlat];
 
     flattenedResults = flattenedResults.map((result) => ({
       ...result,
       weight: result.weight ?? (weightMap.get(result.source) ?? 0),
     }));
 
-    if (!config.SiteConfig?.DisableYellowFilter) {
+    if (!config.SiteConfig.DisableYellowFilter) {
       flattenedResults = flattenedResults.filter((result) => {
         const typeName = result.type_name || '';
         return !yellowWords.some((word: string) => typeName.includes(word));
       });
     }
 
-    // 排序
-    flattenedResults.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+    // 按权重降序排序
+    flattenedResults.sort((a, b) => {
+      const weightA = a.weight ?? 0;
+      const weightB = b.weight ?? 0;
+      return weightB - weightA;
+    });
 
-    // 宽松二次过滤：只有当抓到了数据时才过滤
-    if (flattenedResults.length > 0 && query && query.trim() !== '') {
-      const cleanKeywords = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-
-      const matchedResults = flattenedResults.filter((item) => {
+    // ==================== 【强效二次关键词过滤逻辑】 ====================
+    // 强制过滤所有标题中不包含搜索词 query 的脏数据（防止不支持搜索的资源站返回默认最新列表污染结果）
+    if (query && query.trim() !== '') {
+      const lowerQuery = query.toLowerCase().trim();
+      flattenedResults = flattenedResults.filter((item) => {
         if (!item) return false;
-        const itemTitle = String(item.title || item.vod_name || item.name || '').toLowerCase();
-        if (!itemTitle) return false;
-
-        return cleanKeywords.every((kw) => itemTitle.includes(kw));
+        const itemTitle = (item.title || item.vod_name || '').toString().toLowerCase();
+        return itemTitle.includes(lowerQuery);
       });
-
-      // 如果二次过滤把所有数据都删光了，说明抓到的都是脏数据（返回的首页推荐）
-      flattenedResults = matchedResults;
     }
+    // ===================================================================
 
     const cacheTime = await getCacheTime();
 
+    if (flattenedResults.length === 0) {
+      // no cache if empty
+      return NextResponse.json({ results: [] }, { status: 200 });
+    }
+
     return NextResponse.json(
-      { 
-        results: flattenedResults,
-        debug: {
-          siteCount: apiSites.length,
-          query: query
-        }
-      },
+      { results: flattenedResults },
       {
         headers: {
           'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}`,
@@ -181,8 +311,8 @@ export async function GET(request: NextRequest) {
         },
       }
     );
-  } catch (error: any) {
-    console.error('[Search] 搜索处理崩溃:', error);
-    return NextResponse.json({ error: error.message || '搜索失败' }, { status: 500 });
+  } catch (error) {
+    console.error('[Search] 搜索结果处理失败:', error);
+    return NextResponse.json({ error: '搜索失败' }, { status: 500 });
   }
 }
