@@ -69,13 +69,10 @@ export async function GET(request: NextRequest) {
   const embySourcesMap = await embyManager.getAllClients();
   const embySources = canAccessEmby ? Array.from(embySourcesMap.values()) : [];
 
-  console.log('[Search] Emby sources count:', embySources.length);
-  console.log('[Search] Emby sources:', embySources.map(s => ({ key: s.config.key, name: s.config.name })));
-
   // 获取代理 token（用于图片代理）
   const proxyToken = await getProxyToken(request);
 
-  // 为每个 Emby 源创建搜索 Promise（全部并发，无限制）
+  // 为每个 Emby 源创建搜索 Promise
   const embyPromises = embySources.map(({ client, config: embyConfig }) =>
     Promise.race([
       (async () => {
@@ -88,7 +85,6 @@ export async function GET(request: NextRequest) {
             Limit: 50,
           });
 
-          // 如果只有一个Emby源，保持旧格式（向后兼容）
           const sourceValue = embySources.length === 1 ? 'emby' : `emby_${embyConfig.key}`;
           const sourceName = embySources.length === 1 ? 'Emby' : embyConfig.name;
 
@@ -120,7 +116,7 @@ export async function GET(request: NextRequest) {
     })
   );
 
-  // 搜索 OpenList（如果配置了）- 异步带超时
+  // 搜索 OpenList
   const openlistPromise = hasOpenList
     ? Promise.race([
         (async () => {
@@ -178,7 +174,7 @@ export async function GET(request: NextRequest) {
       })
     : Promise.resolve([]);
 
-  // 添加超时控制和错误处理，避免慢接口拖累整体响应
+  // API 源搜索
   const searchPromises = apiSites.map((site) =>
     Promise.race([
       searchFromApi(site, query),
@@ -187,10 +183,11 @@ export async function GET(request: NextRequest) {
       ),
     ]).catch((err) => {
       console.warn(`搜索失败 ${site.name}:`, err.message);
-      return []; // 返回空数组而不是抛出错误
+      return [];
     })
   );
 
+  // 脚本源搜索
   const scriptSummaries = await listEnabledSourceScripts();
   const scriptPromises = scriptSummaries.map((script) =>
     Promise.race([
@@ -248,13 +245,11 @@ export async function GET(request: NextRequest) {
       ...scriptPromises,
     ]);
 
-    // 分离结果
     const openlistResults = Array.isArray(allResults[0]) ? allResults[0] : [];
     const embyResultsArray = allResults.slice(1, 1 + embyPromises.length);
     const apiResults = allResults.slice(1 + embyPromises.length, 1 + embyPromises.length + searchPromises.length);
     const scriptResults = allResults.slice(1 + embyPromises.length + searchPromises.length);
 
-    // 合并所有结果
     const embyResults = embyResultsArray.filter(Array.isArray).flat();
     const apiResultsFlat = apiResults.filter(Array.isArray).flat();
     const scriptResultsFlat = scriptResults.filter(Array.isArray).flat();
@@ -273,31 +268,36 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // 按权重降序排序
-    flattenedResults.sort((a, b) => {
-      const weightA = a.weight ?? 0;
-      const weightB = b.weight ?? 0;
-      return weightB - weightA;
-    });
+    // 按权重排序
+    flattenedResults.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
 
-    // ==================== 【容错二次关键词过滤】 ====================
-    if (query && typeof query === 'string') {
-      const cleanQuery = query.trim().toLowerCase();
-      
-      if (cleanQuery.length > 0) {
-        flattenedResults = flattenedResults.filter((item) => {
-          if (!item) return false;
-
-          // 提取可能存在的标题字段
-          const titleCandidate = item.title || item.vod_name || item.name || '';
-          const cleanTitle = String(titleCandidate).trim().toLowerCase();
-
-          // 只要标题包含搜索词，或者搜索词包含标题，就保留
-          return cleanTitle.includes(cleanQuery) || cleanQuery.includes(cleanTitle);
-        });
-      }
+    // ==================== 📊 调试日志打印 ====================
+    console.log(`[Search Debug] 关键词: "${query}" | 过滤前原始数据总数: ${flattenedResults.length}`);
+    if (flattenedResults.length > 0) {
+      console.log(
+        `[Search Debug] 原始标题样例:`,
+        flattenedResults.slice(0, 5).map((i) => i.title || i.vod_name || i.name)
+      );
     }
-    // =============================================================
+    // =========================================================
+
+    // ==================== 🔍 智能关键词二次过滤 ====================
+    if (query && query.trim() !== '') {
+      // 支持按空格切分多关键词匹配
+      const cleanKeywords = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+      flattenedResults = flattenedResults.filter((item) => {
+        if (!item) return false;
+        const itemTitle = String(item.title || item.vod_name || item.name || '').toLowerCase();
+        if (!itemTitle) return false;
+
+        // 要求标题中包含搜索关键词的每一个拆分词
+        return cleanKeywords.every((kw) => itemTitle.includes(kw));
+      });
+    }
+    // ==============================================================
+
+    console.log(`[Search Debug] 过滤后匹配到的数据总数: ${flattenedResults.length}`);
 
     const cacheTime = await getCacheTime();
 
