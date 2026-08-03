@@ -248,14 +248,13 @@ export async function GET(request: NextRequest) {
       ...scriptPromises,
     ]);
 
-    // 分离结果：第一个是 openlist，接下来是 emby 结果，最后是 api 结果
-    // 添加安全检查，确保即使某个结果处理出错也不影响其他结果
+    // 分离结果
     const openlistResults = Array.isArray(allResults[0]) ? allResults[0] : [];
     const embyResultsArray = allResults.slice(1, 1 + embyPromises.length);
     const apiResults = allResults.slice(1 + embyPromises.length, 1 + embyPromises.length + searchPromises.length);
     const scriptResults = allResults.slice(1 + embyPromises.length + searchPromises.length);
 
-    // 合并所有 Emby 结果，添加安全检查
+    // 合并所有结果
     const embyResults = embyResultsArray.filter(Array.isArray).flat();
     const apiResultsFlat = apiResults.filter(Array.isArray).flat();
     const scriptResultsFlat = scriptResults.filter(Array.isArray).flat();
@@ -281,22 +280,28 @@ export async function GET(request: NextRequest) {
       return weightB - weightA;
     });
 
-    // ==================== 【强效二次关键词过滤逻辑】 ====================
-    // 强制过滤所有标题中不包含搜索词 query 的脏数据（防止不支持搜索的资源站返回默认最新列表污染结果）
-    if (query && query.trim() !== '') {
-      const lowerQuery = query.toLowerCase().trim();
-      flattenedResults = flattenedResults.filter((item) => {
-        if (!item) return false;
-        const itemTitle = (item.title || item.vod_name || '').toString().toLowerCase();
-        return itemTitle.includes(lowerQuery);
-      });
+    // ==================== 【容错二次关键词过滤】 ====================
+    if (query && typeof query === 'string') {
+      const cleanQuery = query.trim().toLowerCase();
+      
+      if (cleanQuery.length > 0) {
+        flattenedResults = flattenedResults.filter((item) => {
+          if (!item) return false;
+
+          // 提取可能存在的标题字段
+          const titleCandidate = item.title || item.vod_name || item.name || '';
+          const cleanTitle = String(titleCandidate).trim().toLowerCase();
+
+          // 只要标题包含搜索词，或者搜索词包含标题，就保留
+          return cleanTitle.includes(cleanQuery) || cleanQuery.includes(cleanTitle);
+        });
+      }
     }
-    // ===================================================================
+    // =============================================================
 
     const cacheTime = await getCacheTime();
 
     if (flattenedResults.length === 0) {
-      // no cache if empty
       return NextResponse.json({ results: [] }, { status: 200 });
     }
 
